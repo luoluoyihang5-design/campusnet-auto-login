@@ -12,13 +12,13 @@ Windows 登录后，自动检测校园网的网页认证并完成登录。适用
 
 ## 环境和安装
 
-需要 Windows、PowerShell 7、Microsoft Edge 和 Windows 自带的 curl。在校园网覆盖范围内，从仓库目录用 PowerShell 7 执行：
+需要 Windows、PowerShell 7、Microsoft Edge，以及 Windows 自带的 curl 和 Windows Script Host（JScript）。在校园网覆盖范围内，从仓库目录用 PowerShell 7 执行：
 
 ```powershell
 .\CampusNet-AutoLogin.ps1 -Setup
 ```
 
-按提示输入校园网账号和密码。脚本将凭据保存到当前 Windows 用户的本机目录，Windows 会为密码加密。安装会注册同名计划任务，在当前用户登录 Windows 时运行。已有同名任务会被更新。
+按提示输入校园网账号和密码。脚本将凭据保存到当前 Windows 用户的本机目录，Windows 会为密码加密。安装会注册计划任务，在当前用户登录 Windows 时后台启动。已有的旧探测任务 `CampusNet-Probe` 会被停用。
 
 ```powershell
 # 检查网络、任务与最近一次运行状态
@@ -28,13 +28,23 @@ Windows 登录后，自动检测校园网的网页认证并完成登录。适用
 Start-ScheduledTask -TaskName CampusNet-AutoLogin
 ```
 
-自动登录需要已解锁的交互式桌面。脚本用 Edge 填写学校的认证页，确认联网后会尝试关闭当前 Windows 会话里的所有 Edge 窗口。手动测试前请先保存浏览器里的工作。认证入口使用 HTTP，本机凭据的加密存储与网络传输加密是两回事。
+如果已经安装，从 GitHub 下载最新版脚本（或在本地仓库执行 `git pull --ff-only`）后，用 PowerShell 7 运行：
+
+```powershell
+.\CampusNet-AutoLogin.ps1 -Update
+```
+
+更新会自检后台启动器，并保留已配置的凭据。更新 Git 仓库后，仍需执行上面的命令，已安装的开机任务才会使用新版。
+
+自动登录需要已解锁的交互式桌面。脚本用 Edge 填写学校的认证页，确认联网后会尝试关闭当前 Windows 会话里的所有 Edge 窗口。已有认证窗口可复用。认证失败时会提示原因，并尝试关闭本次任务新开的认证窗口。手动测试前请先保存浏览器里的工作。认证入口使用 HTTP，本机凭据的加密存储与网络传输加密是两回事。
 
 ## 排查与停用
 
 - `campus_interface_unavailable`：检查是否连上校园网，且只有一个匹配的 IPv4 地址。
 - `already_online`：探测成功，无需登录。
 - `login_verified`：提交后已重新探测并确认联网。
+- `portal_rejected`：认证页返回登录失败。
+- `portal_form_unavailable`：等待超时，未找到认证表单。
 - `submitted_unverified`：表单已提交，尚未确认联网。可在 Edge 手动检查认证页。
 - `portal_returned_after_close`：关闭 Edge 后再次出现认证跳转。
 

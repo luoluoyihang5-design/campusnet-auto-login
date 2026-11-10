@@ -6,7 +6,9 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'Run')]
     [switch] $Run,
     [Parameter(Mandatory, ParameterSetName = 'Check')]
-    [switch] $Check
+    [switch] $Check,
+    [Parameter(Mandatory, ParameterSetName = 'Update')]
+    [switch] $Update
 )
 
 $ErrorActionPreference = 'Stop'
@@ -80,23 +82,32 @@ function Find-Control($root, $type, [string] $name) {
         [System.Windows.Automation.AndCondition]::new($conditions))
 }
 
-function Find-PortalDocument([uri] $expected) {
+function Find-PortalDocument([uri] $expected, [ref] $browserWindow,
+    [IntPtr] $OnlyWindow = [IntPtr]::Zero, [switch] $EntryOnly, [switch] $LoginResult) {
     $a = [System.Windows.Automation.AutomationElement]
     $documentType = [System.Windows.Automation.ControlType]::Document
     $condition = [System.Windows.Automation.PropertyCondition]::new($a::ControlTypeProperty, $documentType)
-    foreach ($edge in (Get-Process msedge -ErrorAction SilentlyContinue)) {
-        if ($edge.MainWindowHandle -eq [IntPtr]::Zero) { continue }
+    $documentName = if ($LoginResult) { '校园宽带业务' } else { '校园宽带' }
+    foreach ($handle in (Get-EdgeWindows)) {
+        if ($OnlyWindow -ne [IntPtr]::Zero -and $handle -ne $OnlyWindow) { continue }
         try {
-            $window = $a::FromHandle($edge.MainWindowHandle)
+            $window = $a::FromHandle($handle)
             foreach ($doc in $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)) {
-                if ($doc.Current.IsOffscreen -or $doc.Current.Name -ne '校园宽带') { continue }
+                if ($doc.Current.IsOffscreen) { continue }
+                if (-not $EntryOnly -and $doc.Current.Name -ne $documentName) { continue }
                 $value = Get-ValuePattern $doc
                 $uri = $null
                 if (-not $value -or
                     -not [uri]::TryCreate($value.Current.Value, [UriKind]::Absolute, [ref] $uri) -or
-                    $uri.GetLeftPart([UriPartial]::Authority) -cne $origin -or $uri.UserInfo -or
-                    $uri.AbsolutePath -cne '/style/school_hbct/pc/index.jsp' -or
-                    -not [System.Web.HttpUtility]::ParseQueryString($uri.Query).Get('paramStr')) { continue }
+                    $uri.GetLeftPart([UriPartial]::Authority) -cne $origin -or $uri.UserInfo) { continue }
+                if ($EntryOnly) {
+                    if (-not $uri.Equals($expected)) { continue }
+                    if ($browserWindow) { $browserWindow.Value = $handle }
+                    return $doc
+                }
+                if (-not $LoginResult -and
+                    ($uri.AbsolutePath -cne '/style/school_hbct/pc/index.jsp' -or
+                    -not [System.Web.HttpUtility]::ParseQueryString($uri.Query).Get('paramStr'))) { continue }
 
                 # Verify the visible frame belongs to the exact portal entry seen on this run.
                 $parent = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($doc)
@@ -106,7 +117,10 @@ function Find-PortalDocument([uri] $expected) {
                         $outerUri = $null
                         if ($parentValue -and
                             [uri]::TryCreate($parentValue.Current.Value, [UriKind]::Absolute, [ref] $outerUri) -and
-                            $outerUri.Equals($expected)) { return $doc }
+                            $outerUri.Equals($expected)) {
+                            if ($browserWindow) { $browserWindow.Value = $handle }
+                            return $doc
+                        }
                     }
                     $parent = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($parent)
                 }
@@ -177,6 +191,18 @@ public static class CampusPortalKeyboard {
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("wtsapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WTSSendMessage(IntPtr server, int sessionId, string title, int titleBytes,
+        string message, int messageBytes, int style, int timeout, out int response,
+        [MarshalAs(UnmanagedType.Bool)] bool wait);
+
+    public static bool NotifyFailure(int sessionId, string message) {
+        const string title = "校园网自动登录";
+        return WTSSendMessage(IntPtr.Zero, sessionId, title, title.Length * 2,
+            message, message.Length * 2, 0x30, 25, out _, false);
+    }
+
     public static IntPtr[] FindEdgeWindows(uint[] processIds) {
         var ids = new HashSet<uint>(processIds);
         var windows = new List<IntPtr>();
@@ -240,20 +266,46 @@ function Set-PortalText($field, [string] $text) {
     return $false
 }
 
-function Close-EdgeWindows {
+function Get-EdgeProcessIds {
     $sessionId = (Get-Process -Id $PID).SessionId
-    $edgeIds = [uint32[]] @(Get-Process msedge -ErrorAction SilentlyContinue |
-        Where-Object SessionId -eq $sessionId | Select-Object -ExpandProperty Id)
-    $windows = [CampusPortalKeyboard]::FindEdgeWindows($edgeIds)
+    Get-Process msedge -ErrorAction SilentlyContinue |
+        Where-Object SessionId -eq $sessionId | Select-Object -ExpandProperty Id
+}
+
+function Get-EdgeWindows {
+    [CampusPortalKeyboard]::FindEdgeWindows([uint32[]] @(Get-EdgeProcessIds))
+}
+
+function Close-EdgeWindows([IntPtr[]] $Only = @()) {
+    $edgeIds = [uint32[]] @(Get-EdgeProcessIds)
+    $windows = @([CampusPortalKeyboard]::FindEdgeWindows($edgeIds) |
+        Where-Object { $Only.Count -eq 0 -or $_ -in $Only })
     if ($windows.Count -eq 0) { return 'no_edge_windows_found' }
     foreach ($window in $windows) {
         [CampusPortalKeyboard]::RequestWindowClose($window, $edgeIds)
     }
     for ($i = 0; $i -lt 15; $i++) {
-        if ([CampusPortalKeyboard]::FindEdgeWindows($edgeIds).Count -eq 0) { return 'closed' }
+        $remaining = @([CampusPortalKeyboard]::FindEdgeWindows($edgeIds) |
+            Where-Object { $_ -in $windows })
+        if ($remaining.Count -eq 0) { return 'closed' }
         Start-Sleep -Milliseconds 200
     }
     return 'edge_windows_remain'
+}
+
+function Send-LoginFailure([string] $status) {
+    $detail = switch ($status) {
+        'portal_rejected' { '认证页拒绝了登录。请检查账号、密码和校园网服务状态。' }
+        'portal_form_unavailable' { '认证页没有及时显示登录表单。' }
+        'submitted_unverified' { '已提交，但校园网仍未确认联网。' }
+        'portal_returned_after_close' { '浏览器关闭后校园网重新要求认证。' }
+        'credential_missing' { '本机还没有配置校园网凭据。' }
+        default { '自动登录未完成。' }
+    }
+    $message = "$detail`n状态：$status`n日志：$logPath"
+    $session = (Get-Process -Id $PID).SessionId
+    if (-not ('CampusPortalKeyboard' -as [type])) { Initialize-PortalKeyboard }
+    [CampusPortalKeyboard]::NotifyFailure($session, $message)
 }
 
 if ($Check) {
@@ -270,34 +322,69 @@ if ($Check) {
 }
 
 if (-not $Run) {
-    $account = (Read-Host '校园网账号').Trim()
-    if (-not $account) { throw '账号不能为空。' }
-    $secret = Read-Host '校园网密码' -AsSecureString
-    if ($secret.Length -eq 0) { throw '密码不能为空。' }
-
+    $existingTask = Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue
+    if ($existingTask.State -eq 'Running') { throw '自动登录任务正在运行，请等本次运行结束后再更新。' }
+    if ($Update -and (-not $existingTask -or -not (Test-Path -LiteralPath $credentialPath))) {
+        throw '未找到已配置的校园网任务或凭据，请先用 -Setup 配置。'
+    }
     [void][IO.Directory]::CreateDirectory($installDir)
-    if ($PSCommandPath -ne $installedScript) {
-        Copy-Item -LiteralPath $PSCommandPath -Destination $installedScript
-    }
-    $tempCredential = "$credentialPath.$PID.tmp"
-    try {
-        [pscredential]::new($account, $secret) | Export-Clixml -LiteralPath $tempCredential
-        [IO.File]::Move($tempCredential, $credentialPath, $true)
-    } finally {
-        $secret.Dispose()
-    }
-
     $pwsh = (Get-Process -Id $PID).Path
     $storeAlias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
     if ($pwsh -like '*\WindowsApps\Microsoft.PowerShell_*' -and
         (Test-Path -LiteralPath $storeAlias)) { $pwsh = $storeAlias }
-    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $action = New-ScheduledTaskAction -Execute $pwsh -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -File "' + $installedScript + '" -Run') -WorkingDirectory $installDir
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Host '配置完成。下线后运行 Start-ScheduledTask -TaskName CampusNet-AutoLogin 立即测试。'
+    $hostExe = Join-Path ([Environment]::SystemDirectory) 'wscript.exe'
+    $launcherPath = Join-Path $installDir 'Launch-CampusNet.js'
+    $launcher = @'
+var shell = new ActiveXObject("WScript.Shell");
+var args = WScript.Arguments;
+if (args.length !== 2) WScript.Quit(2);
+var command = '"' + args.Item(0) + '" -NoProfile -NonInteractive ';
+if (args.Item(1) === "--check") {
+    command += '-Command "exit 0"';
+} else {
+    command += '-File "' + args.Item(1) + '" -Run';
+}
+WScript.Quit(shell.Run(command, 0, true));
+'@
+    [IO.File]::WriteAllText($launcherPath, $launcher, [Text.Encoding]::ASCII)
+    $launcherArguments = '//B //NoLogo //E:JScript "{0}" "{1}"' -f $launcherPath, $pwsh
+    $smokeTest = Start-Process -FilePath $hostExe -ArgumentList ($launcherArguments + ' --check') -PassThru -Wait
+    if ($smokeTest.ExitCode -ne 0) { throw '后台启动器自检失败，计划任务未更新。' }
+
+    if (-not $Update) {
+        $account = (Read-Host '校园网账号').Trim()
+        if (-not $account) { throw '账号不能为空。' }
+        $secret = Read-Host '校园网密码' -AsSecureString
+        $tempCredential = "$credentialPath.$PID.tmp"
+        try {
+            if ($secret.Length -eq 0) { throw '密码不能为空。' }
+            [pscredential]::new($account, $secret) | Export-Clixml -LiteralPath $tempCredential
+            [IO.File]::Move($tempCredential, $credentialPath, $true)
+        } finally {
+            $secret.Dispose()
+        }
+    }
+    if ($PSCommandPath -ne $installedScript) {
+        $tempScript = "$installedScript.$PID.tmp"
+        Copy-Item -LiteralPath $PSCommandPath -Destination $tempScript
+        [IO.File]::Move($tempScript, $installedScript, $true)
+    }
+
+    $action = New-ScheduledTaskAction -Execute $hostExe -Argument ($launcherArguments + ' "' + $installedScript + '"') -WorkingDirectory $installDir
+    if ($Update) {
+        Set-ScheduledTask -TaskName $taskName -TaskPath '\' -Action $action | Out-Null
+    } else {
+        $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    }
+    $oldProbe = Get-ScheduledTask -TaskName 'CampusNet-Probe' -TaskPath '\' -ErrorAction SilentlyContinue
+    if ($oldProbe -and $oldProbe.State -ne 'Disabled') {
+        Disable-ScheduledTask -InputObject $oldProbe | Out-Null
+    }
+    Write-Host '配置完成。后台启动器自检通过，旧探测任务已停用或不存在。'
     return
 }
 
@@ -309,6 +396,9 @@ $result = [ordered] @{
     httpStatus = $null
     finishedAt = $null
 }
+$portalDetected = $false
+$launchRequested = $false
+$ownedWindow = [IntPtr]::Zero
 try {
     for ($i = 0; $i -lt 12; $i++) {
         $probe = Get-CampusProbe
@@ -320,6 +410,7 @@ try {
         Start-Sleep -Seconds 3
     }
     if ($probe.Status -ne 'portal_detected') { return }
+    $portalDetected = $true
     if (-not (Test-Path -LiteralPath $credentialPath)) {
         $result.status = 'credential_missing'
         return
@@ -330,14 +421,40 @@ try {
     Add-Type -AssemblyName UIAutomationTypes
     $edgePath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'
     if (-not (Test-Path -LiteralPath $edgePath)) { return }
-    Start-Process -FilePath $edgePath -ArgumentList ('"' + $probe.PortalUri.AbsoluteUri + '"')
-
+    Initialize-PortalKeyboard
     $result.status = 'portal_form_unavailable'
+    $portalView = $null
+    # Windows may already be opening its captive-portal page at sign-in.
+    for ($i = 0; $i -lt 8; $i++) {
+        $portalView = Find-PortalDocument $probe.PortalUri -EntryOnly
+        if ($portalView) { break }
+        Start-Sleep -Seconds 1
+    }
+    $existingWindows = @(Get-EdgeWindows)
+    if (-not $portalView) {
+        $portalView = Find-PortalDocument $probe.PortalUri -EntryOnly
+    }
+    if ($portalView) {
+        $result.portalWindow = 'reused'
+    } else {
+        Start-Process -FilePath $edgePath -ArgumentList @('--new-window', ('"' + $probe.PortalUri.AbsoluteUri + '"'))
+        $launchRequested = $true
+        $result.portalWindow = 'opened'
+    }
+
     $buttonType = [System.Windows.Automation.ControlType]::Button
     $editType = [System.Windows.Automation.ControlType]::Edit
     $tabOpened = $false
+    $authenticationWindow = [IntPtr]::Zero
     for ($i = 0; $i -lt 30; $i++) {
-        $doc = Find-PortalDocument $probe.PortalUri
+        if ($launchRequested -and $ownedWindow -eq [IntPtr]::Zero) {
+            $entryWindow = [IntPtr]::Zero
+            $null = Find-PortalDocument $probe.PortalUri -EntryOnly -browserWindow ([ref] $entryWindow)
+            if ($entryWindow -ne [IntPtr]::Zero -and $entryWindow -notin $existingWindows) {
+                $ownedWindow = $entryWindow
+            }
+        }
+        $doc = Find-PortalDocument $probe.PortalUri -browserWindow ([ref] $authenticationWindow)
         if ($doc) {
             $accountField = Find-Control $doc $editType '请输入账号'
             $passwordField = Find-Control $doc $editType '请输入密码'
@@ -361,7 +478,6 @@ try {
     if (-not $accountValue -or -not $submit -or $accountValue.Current.IsReadOnly) { return }
 
     $result.status = 'credential_or_input_unavailable'
-    Initialize-PortalKeyboard
     $credential = Import-Clixml -LiteralPath $credentialPath
     $result.status = 'account_focus_failed'
     if (-not (Set-PortalText $accountField $credential.UserName)) { return }
@@ -386,7 +502,7 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if (-not $focusMoved) { return }
-    $doc = Find-PortalDocument $probe.PortalUri
+    $doc = Find-PortalDocument $probe.PortalUri -OnlyWindow $authenticationWindow
     if (-not $doc) { return }
     $submit = Find-Control $doc $buttonType '登录'
     if (-not $submit) { return }
@@ -408,11 +524,37 @@ try {
             }
             break
         }
+        $portalResult = Find-PortalDocument $probe.PortalUri -OnlyWindow $authenticationWindow -LoginResult
+        if ($portalResult -and (Find-Control $portalResult ([System.Windows.Automation.ControlType]::Text) '登录失败')) {
+            $result.status = 'portal_rejected'
+            break
+        }
     }
 } catch {
     # UI automation exceptions can contain page text. Keep the current stage only.
     $result.errorType = $_.Exception.GetType().Name
 } finally {
+    if (($portalDetected -or $result.sourceIp) -and $result.status -notin @('login_verified', 'already_online')) {
+        if ($ownedWindow -ne [IntPtr]::Zero -and -not $result.browserClose) {
+            try {
+                $ownedPortal = Find-PortalDocument $probe.PortalUri -OnlyWindow $ownedWindow -EntryOnly
+                if ($ownedPortal) {
+                    $result.browserClose = Close-EdgeWindows -Only @($ownedWindow)
+                } else {
+                    $result.browserClose = 'portal_not_in_owned_window'
+                }
+            } catch {
+                $result.browserClose = 'close_check_failed'
+            }
+        } elseif (-not $result.browserClose -and $result.portalWindow -eq 'reused') {
+            $result.browserClose = 'reused_window_preserved'
+        }
+        try {
+            $result.failureNotification = Send-LoginFailure $result.status
+        } catch {
+            $result.failureNotification = $false
+        }
+    }
     $result.finishedAt = [DateTimeOffset]::Now.ToString('o')
     $tempLog = "$logPath.$PID.tmp"
     $result | ConvertTo-Json | Set-Content -LiteralPath $tempLog -Encoding utf8
