@@ -1,0 +1,9 @@
+# Local credentials and runtime state
+credential.xml
+credential.xml.*.tmp
+last-run.json
+last-run.json.*.tmp
+last-probe.json
+*.log
+.env
+.env.*
